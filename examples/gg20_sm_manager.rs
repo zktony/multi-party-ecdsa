@@ -1,11 +1,11 @@
 use std::collections::hash_map::{Entry, HashMap};
-use std::convert::Infallible;
 use std::sync::{
     atomic::{AtomicU16, Ordering},
     Arc,
 };
 
-use futures::stream::{pending, Stream};
+use futures::Stream;
+use rocket::data::ToByteUnit;
 use rocket::http::Status;
 use rocket::request::{FromRequest, Outcome, Request};
 use rocket::response::stream::{stream, Event, EventStream};
@@ -17,16 +17,22 @@ use tokio::sync::{Notify, RwLock};
 #[rocket::get("/rooms/<room_id>/subscribe")]
 async fn subscribe(
     db: &State<Db>,
+    mut shutdown: rocket::Shutdown,
     last_seen_msg: LastEventId,
     room_id: &str,
 ) -> EventStream<impl Stream<Item = Event>> {
     let room = db.get_room_or_create_empty(room_id).await;
     let mut subscription = room.subscribe(last_seen_msg.0);
     EventStream::from(stream! {
-        let (id, msg) = subscription.next().await;
-        yield Event::data(msg)
-            .event("new-message")
-            .id(id.to_string())
+        loop {
+            let (id, msg) = tokio::select! {
+                message = subscription.next() => message,
+                _ = &mut shutdown => return,
+            };
+            yield Event::data(msg)
+                .event("new-message")
+                .id(id.to_string())
+        }
     })
 }
 
@@ -40,7 +46,7 @@ async fn issue_idx(db: &State<Db>, room_id: &str) -> Json<IssuedUniqueIdx> {
 #[rocket::post("/rooms/<room_id>/broadcast", data = "<message>")]
 async fn broadcast(db: &State<Db>, room_id: &str, message: String) -> Status {
     let room = db.get_room_or_create_empty(room_id).await;
-    room.publish(message);
+    room.publish(message).await;
     Status::Ok
 }
 
@@ -70,6 +76,7 @@ impl Db {
                 return room.clone();
             }
         }
+        drop(rooms);
 
         let mut rooms = self.rooms.write().await;
         match rooms.entry(room_id.to_owned()) {
@@ -90,7 +97,7 @@ impl Room {
             messages: RwLock::new(vec![]),
             message_appeared: Notify::new(),
             subscribers: AtomicU16::new(0),
-            next_idx: AtomicU16::new(0),
+            next_idx: AtomicU16::new(1),
         }
     }
 
@@ -171,4 +178,16 @@ struct IssuedUniqueIdx {
     unique_idx: u16,
 }
 
-fn main() {}
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let figment = rocket::Config::figment().merge((
+        "limits",
+        rocket::data::Limits::new().limit("string", 100.megabytes()),
+    ));
+    rocket::custom(figment)
+        .mount("/", rocket::routes![subscribe, issue_idx, broadcast])
+        .manage(Db::empty())
+        .launch()
+        .await?;
+    Ok(())
+}

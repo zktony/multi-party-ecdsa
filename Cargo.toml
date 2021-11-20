@@ -26,7 +26,7 @@ categories = ["cryptography"]
 crate-type = ["lib"]
 
 [features]
-default = ["curv/rust-gmp-kzen"]
+default = ["curv/num-bigint"]
 cclst = ["class_group"]
 
 [dependencies]
